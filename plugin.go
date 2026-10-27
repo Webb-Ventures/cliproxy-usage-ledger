@@ -15,9 +15,13 @@ import (
 // cgo glue so the package still builds (and tests run) with CGO_ENABLED=0.
 func main() {}
 
+// pluginVersion is reported in plugin.register metadata, the status route,
+// and the price fetcher's User-Agent. Release builds set it from the git tag
+// with -ldflags "-X main.pluginVersion=<version>", so it must stay a var.
+var pluginVersion = "0.1.0"
+
 const (
 	pluginName       = "usage-ledger"
-	pluginVersion    = "0.1.0"
 	pluginAuthor     = "Webb Ventures"
 	pluginRepository = "https://github.com/Webb-Ventures/cliproxy-usage-ledger"
 

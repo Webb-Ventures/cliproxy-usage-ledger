@@ -11,7 +11,7 @@ usage at read time, so old ranges are re-priced the same way ccusage does.
 > **Status: prices and routes (step 3).** Records are rolled up into
 > per-minute and per-hour buckets in SQLite (schema v2), and the summary,
 > series, windows, blocks, prices, settings, and export routes are served.
-> Release builds come next.
+> Tagged releases publish prebuilt libraries (see [Releases](#releases)).
 
 ## How it plugs into CPA
 
@@ -738,6 +738,54 @@ go vet ./...
 CC=/usr/bin/clang go build -buildmode=c-shared -o dist/usage-ledger.dylib .
 ```
 
+`scripts/build-release.sh <version> [outdir]` builds the same way the release
+workflow does: it stamps the version, strips the binary, deletes the header,
+and writes `usage-ledger-v<version>.<so|dylib|dll>`.
+
+## Releases
+
+Pushing a tag `vX.Y.Z` runs `.github/workflows/release.yml`. It runs the CI
+checks (`gofmt -l`, `go vet`, `go test -race`, and a c-shared build, the same
+as `ci.yml` on pushes to `main` and on pull requests), builds the library on
+a native runner per platform, and publishes a GitHub Release. A tag with a
+suffix, such as `v0.2.0-rc.1`, is published as a prerelease.
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The tag minus its `v` becomes the plugin version. It is set with
+`-ldflags "-X main.pluginVersion=<version>"` and reported in registration
+metadata, the status route, and the price fetcher's User-Agent. Local builds
+report the default in `plugin.go`.
+
+Release assets:
+
+| Asset | Contents |
+| --- | --- |
+| `usage-ledger_<version>_linux_amd64.zip` | `usage-ledger-v<version>.so` |
+| `usage-ledger_<version>_linux_arm64.zip` | `usage-ledger-v<version>.so` |
+| `usage-ledger_<version>_darwin_arm64.zip` | `usage-ledger-v<version>.dylib` |
+| `usage-ledger_<version>_darwin_amd64.zip` | `usage-ledger-v<version>.dylib` |
+| `usage-ledger_<version>_windows_amd64.zip` | `usage-ledger-v<version>.dll` |
+| `checksums.txt` | SHA-256 of each zip, in `sha256sum` format |
+
+These names follow CPA's plugin store, which downloads
+`<id>_<version>_<goos>_<goarch>.zip`, verifies it against `checksums.txt`, and
+installs the library from the zip root. The library inside is already named
+`<id>-v<version>`, so CPA reads the plugin ID as `usage-ledger`. Do not rename
+it to the zip's name: the ID would no longer match the
+`plugins.configs.usage-ledger` entry. Linux builds link against glibc 2.17
+(manylinux2014), the same floor as CPA's own Linux binaries. macOS builds
+target macOS 12, the oldest version Go 1.26 supports.
+
+To install by hand, check the zip and unpack it into the platform directory:
+
+```sh
+sha256sum --check --ignore-missing checksums.txt
+unzip usage-ledger_0.2.0_linux_amd64.zip -d plugins/linux/amd64/
+```
+
 ## Install into CLIProxyAPI
 
 1. Copy the library into CPA's plugins directory. That directory is
@@ -751,7 +799,8 @@ CC=/usr/bin/clang go build -buildmode=c-shared -o dist/usage-ledger.dylib .
    plugins/darwin/arm64/usage-ledger-v0.1.0.dylib
    ```
 
-   Use `.so` on Linux and `.dll` on Windows.
+   Use `.so` on Linux and `.dll` on Windows. Release zips already contain the
+   versioned file (see [Releases](#releases)).
 
 2. Enable plugins and this plugin in CPA's `config.yaml`. A plugin without a
    `plugins.configs.<id>` entry is disabled.

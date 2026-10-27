@@ -128,7 +128,7 @@ func TestPriceRefreshSuccessWritesCache(t *testing.T) {
 	if srv.hits.Load() != 1 {
 		t.Fatalf("requests = %d, want exactly 1", srv.hits.Load())
 	}
-	if ua := srv.agent.Load().(string); !strings.HasPrefix(ua, "cliproxy-usage-ledger/") {
+	if ua := srv.agent.Load().(string); !strings.HasPrefix(ua, "cliproxy-usage-ledger/"+pluginVersion+" ") {
 		t.Fatalf("User-Agent = %q", ua)
 	}
 	snap := m.snapshot()

@@ -1,0 +1,190 @@
+name: Release
+
+# Pushing a tag vX.Y.Z (or vX.Y.Z-suffix, published as a prerelease) builds
+# the plugin on every supported platform and publishes a GitHub Release with
+#   usage-ledger_<version>_<goos>_<goarch>.zip  (one per platform)
+#   checksums.txt                               (SHA-256 of every zip)
+# Each zip holds usage-ledger-v<version>.<so|dylib|dll> at its root. That is
+# the layout CPA's plugin store downloads and verifies
+# (internal/pluginstore: ArchiveName, readTargetLibrary, ParseChecksums).
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  checks:
+    name: checks
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: checks
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # cgo cross-compiling needs a target C toolchain and sysroot, so each
+          # target builds on a native runner. Linux builds run inside
+          # manylinux2014 (glibc 2.17), the same floor CPA's own Linux release
+          # binaries use, so the library loads wherever CPA itself runs.
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-24.04
+            # quay.io/pypa/manylinux2014_x86_64:latest as of 2026-10-27
+            image: quay.io/pypa/manylinux2014_x86_64@sha256:296069bc05d85275248f168f6e3b34ba8aa06181b67e40cd7447c64d56d3a851
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-24.04-arm
+            # quay.io/pypa/manylinux2014_aarch64:latest as of 2026-10-27
+            image: quay.io/pypa/manylinux2014_aarch64@sha256:ec445e2688785976c727d304f421ae8af5489715c19508526a749716e240541a
+          - goos: darwin
+            goarch: arm64
+            runner: macos-15
+          - goos: darwin
+            goarch: amd64
+            runner: macos-15-intel
+          # The Windows image ships MinGW-w64 gcc on PATH, which cgo uses.
+          - goos: windows
+            goarch: amd64
+            runner: windows-2025
+    defaults:
+      run:
+        shell: bash
+    env:
+      WANT_GOOS: ${{ matrix.goos }}
+      WANT_GOARCH: ${{ matrix.goarch }}
+      OUT_DIR: dist/${{ matrix.goos }}_${{ matrix.goarch }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Check runner platform
+        run: |
+          got="$(go env GOOS)/$(go env GOARCH)"
+          if [[ "$got" != "$WANT_GOOS/$WANT_GOARCH" ]]; then
+            echo "::error::runner builds $got, want $WANT_GOOS/$WANT_GOARCH"
+            exit 1
+          fi
+
+      - name: Build (manylinux2014)
+        if: matrix.goos == 'linux'
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          go mod download
+          # Reuse the host's Go toolchain (statically linked) and module cache
+          # so the container builds offline with the exact checked toolchain.
+          docker run --rm \
+            -v "$PWD:/src" -w /src \
+            -v "$(go env GOROOT):/usr/local/go:ro" \
+            -v "$(go env GOMODCACHE):/go/pkg/mod:ro" \
+            -e GOMODCACHE=/go/pkg/mod \
+            -e GOCACHE=/tmp/go-build \
+            -e GOPROXY=off \
+            -e GOTOOLCHAIN=local \
+            "$IMAGE" \
+            bash -c 'export PATH="/usr/local/go/bin:$PATH" && bash scripts/build-release.sh "$@"' \
+            _ "${GITHUB_REF_NAME#v}" "$OUT_DIR"
+
+      - name: Check glibc floor
+        if: matrix.goos == 'linux'
+        run: |
+          set -euo pipefail
+          lib="$(echo "$OUT_DIR"/usage-ledger-v*.so)"
+          max="$(readelf --version-info "$lib" | sed -n 's/.*Name: GLIBC_\([0-9.]*\).*/\1/p' | sort -Vu | tail -n 1)"
+          echo "$lib needs GLIBC_${max:-none}"
+          if [[ -n "$max" && "$(printf '2.17\n%s\n' "$max" | sort -V | tail -n 1)" != "2.17" ]]; then
+            echo "::error::$lib requires GLIBC_$max, want 2.17 or older"
+            exit 1
+          fi
+
+      - name: Build
+        if: matrix.goos != 'linux'
+        run: bash scripts/build-release.sh "${GITHUB_REF_NAME#v}" "$OUT_DIR"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lib_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: ${{ env.OUT_DIR }}/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      TARGETS: linux_amd64 linux_arm64 darwin_arm64 darwin_amd64 windows_amd64
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: lib_*
+          path: libs
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p release
+          for target in $TARGETS; do
+            case "$target" in
+              darwin_*) ext=dylib ;;
+              windows_*) ext=dll ;;
+              *) ext=so ;;
+            esac
+            lib="libs/lib_${target}/usage-ledger-v${version}.${ext}"
+            if [[ ! -f "$lib" ]]; then
+              echo "::error::missing $lib"
+              exit 1
+            fi
+            # Artifact downloads drop the executable bit; CPA installs the
+            # library with the mode stored in the zip.
+            chmod 0755 "$lib"
+            zip -X -j "release/usage-ledger_${version}_${target}.zip" "$lib"
+          done
+          cd release
+          sha256sum -- *.zip > checksums.txt
+          cat checksums.txt
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          flags=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            "${flags[@]}" \
+            release/*.zip release/checksums.txt

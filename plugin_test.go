@@ -215,7 +215,7 @@ func TestStatusJSONShape(t *testing.T) {
 	// Before register: no database, so every database field is null.
 	assertStatus(t, p, map[string]any{
 		"schema":              float64(1),
-		"plugin_version":      "0.1.0",
+		"plugin_version":      pluginVersion,
 		"records_total":       float64(0),
 		"dropped_total":       float64(0),
 		"skipped_total":       float64(0),
@@ -235,7 +235,7 @@ func TestStatusJSONShape(t *testing.T) {
 	waitFor(t, "record flushed", func() bool { return p.recordsTotal.Load() == 1 })
 	got := assertStatus(t, p, map[string]any{
 		"schema":              float64(1),
-		"plugin_version":      "0.1.0",
+		"plugin_version":      pluginVersion,
 		"records_total":       float64(1),
 		"dropped_total":       float64(0),
 		"skipped_total":       float64(0),
@@ -359,7 +359,7 @@ func TestRegistrationPayload(t *testing.T) {
 	if !env.OK || r.SchemaVersion != pluginSchemaVersion {
 		t.Fatalf("ok=%v schema=%d", env.OK, r.SchemaVersion)
 	}
-	if r.Metadata.Name != "usage-ledger" || r.Metadata.Version != "0.1.0" ||
+	if r.Metadata.Name != "usage-ledger" || r.Metadata.Version != pluginVersion ||
 		r.Metadata.Author != "Webb Ventures" ||
 		r.Metadata.GitHubRepository != "https://github.com/Webb-Ventures/cliproxy-usage-ledger" {
 		t.Fatalf("metadata = %+v", r.Metadata)
