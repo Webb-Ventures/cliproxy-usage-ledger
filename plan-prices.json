@@ -1,0 +1,194 @@
+{
+  "as_of": "2026-10-27",
+  "note": "Public US list prices for monthly billing, per account unless billing is per_seat. verified=true means the price was read on the provider's own pricing page on as_of; verified=false means it comes from secondary sources and should be confirmed. No provider API reports what a plan costs; override per credential in settings for annual, regional, or team pricing.",
+  "plans": {
+    "claude": {
+      "pro": {
+        "name": "Claude Pro",
+        "monthly_price": 20,
+        "currency": "USD",
+        "billing": "per_account",
+        "as_of": "2026-10-27",
+        "source_url": "https://claude.com/pricing",
+        "verified": true,
+        "note": "$20 billed monthly; $17/month billed annually."
+      },
+      "max_5x": {
+        "name": "Claude Max 5x",
+        "monthly_price": 100,
+        "currency": "USD",
+        "billing": "per_account",
+        "as_of": "2026-10-27",
+        "source_url": "https://claude.com/pricing",
+        "verified": true,
+        "note": "Pricing page lists Max \"From $100 per month\"; 5x is the entry tier."
+      },
+      "max_20x": {
+        "name": "Claude Max 20x",
+        "monthly_price": 200,
+        "currency": "USD",
+        "billing": "per_account",
+        "as_of": "2026-10-27",
+        "source_url": "https://claude.com/pricing",
+        "verified": false,
+        "note": "The pricing page names the 20x tier without stating its price; $200 is the long-standing list price."
+      },
+      "team_standard": {
+        "name": "Claude Team (standard seat)",
+        "monthly_price": 25,
+        "currency": "USD",
+        "billing": "per_seat",
+        "as_of": "2026-10-27",
+        "source_url": "https://claude.com/pricing",
+        "verified": true,
+        "note": "$25 per seat billed monthly; $20 billed annually."
+      },
+      "team_premium": {
+        "name": "Claude Team (premium seat)",
+        "monthly_price": 125,
+        "currency": "USD",
+        "billing": "per_seat",
+        "as_of": "2026-10-27",
+        "source_url": "https://claude.com/pricing",
+        "verified": true,
+        "note": "$125 per seat billed monthly; $100 billed annually."
+      }
+    },
+    "codex": {
+      "plus": {
+        "name": "ChatGPT Plus",
+        "monthly_price": 20,
+        "currency": "USD",
+        "billing": "per_account",
+        "as_of": "2026-10-27",
+        "source_url": "https://chatgpt.com/pricing/",
+        "verified": false,
+        "note": "chatgpt.com/pricing returned HTTP 403 to automated fetches; price from secondary sources."
+      },
+      "prolite": {
+        "name": "ChatGPT Pro (5x)",
+        "monthly_price": 100,
+        "currency": "USD",
+        "billing": "per_account",
+        "as_of": "2026-10-27",
+        "source_url": "https://chatgpt.com/pricing/",
+        "verified": false,
+        "note": "The $100 Pro tier reported since April 2026; Codex reports it as plan_type prolite. Secondary sources only."
+      },
+      "pro": {
+        "name": "ChatGPT Pro (20x)",
+        "monthly_price": 200,
+        "currency": "USD",
+        "billing": "per_account",
+        "as_of": "2026-10-27",
+        "source_url": "https://chatgpt.com/pricing/",
+        "verified": false,
+        "note": "Secondary sources only."
+      },
+      "business": {
+        "name": "ChatGPT Business",
+        "monthly_price": 25,
+        "currency": "USD",
+        "billing": "per_seat",
+        "as_of": "2026-10-27",
+        "source_url": "https://chatgpt.com/pricing/",
+        "verified": false,
+        "note": "Standard seat, billed monthly ($20 billed annually), repriced in April 2026 per secondary sources."
+      },
+      "team": {
+        "name": "ChatGPT Team (now Business)",
+        "monthly_price": 25,
+        "currency": "USD",
+        "billing": "per_seat",
+        "as_of": "2026-10-27",
+        "source_url": "https://chatgpt.com/pricing/",
+        "verified": false,
+        "note": "Team was renamed Business; same price. Kept for credentials that still report plan_type team."
+      }
+    },
+    "xai": {
+      "supergrok": {
+        "name": "SuperGrok",
+        "monthly_price": 30,
+        "currency": "USD",
+        "billing": "per_account",
+        "as_of": "2026-10-27",
+        "source_url": "https://x.ai/grok",
+        "verified": false,
+        "note": "x.ai returned HTTP 403 to automated fetches. Secondary sources report existing subscribers keep this price after xAI's October 2026 move to an X Subscription for new sign-ups."
+      },
+      "supergrok_heavy": {
+        "name": "SuperGrok Heavy",
+        "monthly_price": 300,
+        "currency": "USD",
+        "billing": "per_account",
+        "as_of": "2026-10-27",
+        "source_url": "https://x.ai/grok",
+        "verified": false,
+        "note": "Secondary sources only; see the supergrok note."
+      }
+    },
+    "antigravity": {
+      "pro": {
+        "name": "Google AI Pro",
+        "monthly_price": 19.99,
+        "currency": "USD",
+        "billing": "per_account",
+        "as_of": "2026-10-27",
+        "source_url": "https://one.google.com/about/google-ai-plans/",
+        "verified": false,
+        "note": "The Google One plans page renders prices client-side and was not readable; secondary sources."
+      },
+      "ultra-lite": {
+        "name": "Google AI Ultra (5x)",
+        "monthly_price": 99.99,
+        "currency": "USD",
+        "billing": "per_account",
+        "as_of": "2026-10-27",
+        "source_url": "https://one.google.com/about/google-ai-plans/",
+        "verified": false,
+        "note": "Assumes Antigravity's g1-ultra-lite-tier is the 5x Ultra plan. Secondary sources."
+      },
+      "ultra": {
+        "name": "Google AI Ultra (20x)",
+        "monthly_price": 199.99,
+        "currency": "USD",
+        "billing": "per_account",
+        "as_of": "2026-10-27",
+        "source_url": "https://one.google.com/about/google-ai-plans/",
+        "verified": false,
+        "note": "Assumes Antigravity's g1-ultra-tier is the 20x Ultra plan; it replaced the single $249.99 Ultra plan in 2026. Secondary sources."
+      }
+    },
+    "devin": {
+      "pro": {
+        "name": "Devin Pro",
+        "monthly_price": 20,
+        "currency": "USD",
+        "billing": "per_account",
+        "as_of": "2026-10-27",
+        "source_url": "https://devin.ai/pricing",
+        "verified": true
+      },
+      "max": {
+        "name": "Devin Max",
+        "monthly_price": 200,
+        "currency": "USD",
+        "billing": "per_account",
+        "as_of": "2026-10-27",
+        "source_url": "https://devin.ai/pricing",
+        "verified": true
+      },
+      "teams": {
+        "name": "Devin Teams",
+        "monthly_price": 80,
+        "currency": "USD",
+        "billing": "per_account",
+        "as_of": "2026-10-27",
+        "source_url": "https://devin.ai/pricing",
+        "verified": true,
+        "note": "$80/month for the team plan plus $40/month per full developer seat."
+      }
+    }
+  }
+}

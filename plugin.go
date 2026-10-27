@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"strings"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,16 +29,16 @@ const (
 	pluginSchemaVersion uint32 = 6
 
 	// statusSchema versions the JSON document served by the status route.
-	statusSchema = 1
+	statusSchema = routeSchema
 
 	// usageBufferSize bounds the ingest queue between the host and the worker.
 	usageBufferSize = 4096
 
-	// statusRoutePath is declared relative; the host resolves it under
-	// /v0/management (internal/pluginhost/management.go normalizeManagementRoute).
-	statusRoutePath     = "usage-ledger/status"
+	// Routes are declared relative (see routeTable in routes.go); the host
+	// resolves them under /v0/management
+	// (internal/pluginhost/management.go normalizeManagementRoute).
 	managementBasePath  = "/v0/management"
-	statusRouteFullPath = managementBasePath + "/" + statusRoutePath
+	statusRouteFullPath = managementBasePath + "/" + routeStatus
 )
 
 // RPC method names, mirrored from sdk/pluginabi/types.go.
@@ -132,6 +132,10 @@ type managementResponse struct {
 
 // usageRecord mirrors pluginapi.UsageRecord. Durations arrive as nanoseconds.
 // Only the fields copied by eventFromRecord (store.go) are persisted.
+//
+// Generate is a pointer so a record that omits it counts as a generation
+// request, matching the host's default (sdk/cliproxy/usage/manager.go
+// GenerateEnabled: nil means true). The host always sends it.
 type usageRecord struct {
 	RequestID            string
 	TraceID              string
@@ -155,7 +159,7 @@ type usageRecord struct {
 	EffectiveServiceTier string
 	ResponseServiceTier  string
 	ResponseModel        string
-	Generate             bool
+	Generate             *bool
 	Stream               bool
 	RequestedAt          time.Time
 	Latency              time.Duration
@@ -188,6 +192,7 @@ type statusResponse struct {
 	PluginVersion     string           `json:"plugin_version"`
 	RecordsTotal      uint64           `json:"records_total"`
 	DroppedTotal      uint64           `json:"dropped_total"`
+	SkippedTotal      uint64           `json:"skipped_total"`
 	WriteErrorsTotal  uint64           `json:"write_errors_total"`
 	LastWriteError    *string          `json:"last_write_error"`
 	RecordingSince    *string          `json:"recording_since"`
@@ -196,6 +201,12 @@ type statusResponse struct {
 	DatabasePath      *string          `json:"database_path"`
 	DatabaseSizeBytes *int64           `json:"database_size_bytes"`
 	RowCounts         map[string]int64 `json:"row_counts"`
+	Prices            statusPrices     `json:"prices"`
+}
+
+type statusPrices struct {
+	Source    string  `json:"source"`
+	FetchedAt *string `json:"fetched_at"`
 }
 
 type statusRetention struct {
@@ -225,14 +236,24 @@ type Plugin struct {
 	records chan usageRecord
 
 	// storeMu guards store. Only the worker goroutine replaces store (holding
-	// storeMu); writes, retention, and status reads hold it while they run.
+	// storeMu); writes, retention, settings writes, and status reads hold it
+	// while they run.
 	storeMu sync.Mutex
 	store   *Store
+
+	// readMu guards reader, the query_only pool route handlers use (query.go).
+	// Handlers hold it shared while they query; only the worker replaces or
+	// closes reader, holding it exclusively.
+	readMu sync.RWMutex
+	reader *storeReader
+
+	prices *priceManager
 
 	control chan controlRequest
 
 	recordsTotal     atomic.Uint64 // records committed to the database
 	droppedTotal     atomic.Uint64
+	skippedTotal     atomic.Uint64 // generate=false records, never stored
 	writeErrorsTotal atomic.Uint64
 	lastWriteError   atomic.Pointer[string]
 	lastRecordAt     atomic.Int64 // UnixNano; 0 means no record yet.
@@ -261,6 +282,7 @@ func NewPlugin(bufferSize int, now func() time.Time) *Plugin {
 		control:           make(chan controlRequest),
 		stop:              make(chan struct{}),
 		done:              make(chan struct{}),
+		prices:            newPriceManager(now),
 	}
 	cfg := DefaultConfig()
 	p.config.Store(&cfg)
@@ -283,6 +305,7 @@ func (p *Plugin) Shutdown() {
 		close(p.stop)
 		// Ensure the worker exists so done is always closed.
 		p.Start()
+		p.prices.stop()
 	})
 	<-p.done
 }
@@ -300,6 +323,7 @@ func (p *Plugin) Status() statusResponse {
 		PluginVersion:    pluginVersion,
 		RecordsTotal:     p.recordsTotal.Load(),
 		DroppedTotal:     p.droppedTotal.Load(),
+		SkippedTotal:     p.skippedTotal.Load(),
 		WriteErrorsTotal: p.writeErrorsTotal.Load(),
 		LastWriteError:   p.lastWriteError.Load(),
 		Retention: statusRetention{
@@ -307,6 +331,8 @@ func (p *Plugin) Status() statusResponse {
 			HourDays:   cfg.HourRetentionDays,
 		},
 	}
+	prices := p.prices.snapshot()
+	status.Prices = statusPrices{Source: prices.table.source, FetchedAt: optionalTime(prices.table.fetchedAt)}
 	if last := p.lastRecordAt.Load(); last != 0 {
 		formatted := time.Unix(0, last).UTC().Format(time.RFC3339)
 		status.LastRecordAt = &formatted
@@ -348,11 +374,7 @@ func (p *Plugin) HandleMethod(method string, request []byte) ([]byte, error) {
 		p.HandleUsage(rec)
 		return okEnvelope(struct{}{})
 	case methodManagementRegister:
-		return okEnvelope(managementRegistrationResponse{Routes: []managementRoute{{
-			Method:      http.MethodGet,
-			Path:        statusRoutePath,
-			Description: "Usage ledger ingest status.",
-		}}})
+		return okEnvelope(managementRegistrationResponse{Routes: managementRoutes()})
 	case methodManagementHandle:
 		var req managementRequest
 		if len(request) > 0 {
@@ -392,6 +414,12 @@ func (p *Plugin) handleLifecycle(request []byte) ([]byte, error) {
 		return nil, errOpen
 	}
 	p.config.Store(&cfg)
+	// Never blocks: the first fetch runs on the refresh goroutine.
+	p.prices.configure(priceConfig{
+		url:       cfg.PriceSourceURL,
+		refresh:   time.Duration(cfg.PriceRefreshHours) * time.Hour,
+		cachePath: filepath.Join(filepath.Dir(path), priceCacheFileName),
+	})
 	return okEnvelope(buildRegistration(req.SchemaVersion))
 }
 
@@ -438,7 +466,7 @@ func configFields() []configField {
 			Name:        "price-source-url",
 			Type:        "string",
 			Default:     defaultPriceSourceURL,
-			Description: "LiteLLM-format model price JSON used for cost estimates.",
+			Description: "LiteLLM-format model price JSON used for cost estimates. Empty disables fetching.",
 		},
 		{
 			Name:        "price-refresh-hours",
@@ -447,20 +475,6 @@ func configFields() []configField {
 			Description: "Hours between price table refreshes.",
 		},
 	}
-}
-
-func (p *Plugin) handleManagement(req managementRequest) managementResponse {
-	path := strings.TrimRight(strings.TrimSpace(req.Path), "/")
-	if path != statusRouteFullPath {
-		return jsonResponse(http.StatusNotFound, map[string]string{"error": "not found"})
-	}
-	method := strings.ToUpper(strings.TrimSpace(req.Method))
-	if method != "" && method != http.MethodGet {
-		resp := jsonResponse(http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-		resp.Headers.Set("Allow", http.MethodGet)
-		return resp
-	}
-	return jsonResponse(http.StatusOK, p.Status())
 }
 
 func jsonResponse(status int, v any) managementResponse {

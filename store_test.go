@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -27,7 +29,7 @@ func openTestStore(t *testing.T, now time.Time) (*Store, string) {
 
 type rollupRow struct {
 	BucketStart                                                   time.Time
-	Provider, Model, AuthIndex, ClientKey                         string
+	Provider, Model, ServiceTier, AuthIndex, ClientKey            string
 	Failed                                                        bool
 	Requests, Failures                                            int64
 	Input, Output, CacheRead, CacheCreation, Reasoning, Unclassif int64
@@ -37,7 +39,7 @@ type rollupRow struct {
 func readRollups(t *testing.T, s *Store, table string) []rollupRow {
 	t.Helper()
 	rows, err := s.db.Query(`SELECT ` + strings.Join(rollupColumns, ", ") + ` FROM ` + table +
-		` ORDER BY bucket_start, provider, model, auth_index, client_key, failed`)
+		` ORDER BY bucket_start, provider, model, service_tier, auth_index, client_key, failed`)
 	if err != nil {
 		t.Fatalf("query %s: %v", table, err)
 	}
@@ -46,7 +48,7 @@ func readRollups(t *testing.T, s *Store, table string) []rollupRow {
 	for rows.Next() {
 		var r rollupRow
 		var bucket int64
-		if err := rows.Scan(&bucket, &r.Provider, &r.Model, &r.AuthIndex, &r.ClientKey, &r.Failed,
+		if err := rows.Scan(&bucket, &r.Provider, &r.Model, &r.ServiceTier, &r.AuthIndex, &r.ClientKey, &r.Failed,
 			&r.Requests, &r.Failures, &r.Input, &r.Output, &r.CacheRead, &r.CacheCreation,
 			&r.Reasoning, &r.Unclassif, &r.Total, &r.LatencyMs); err != nil {
 			t.Fatalf("scan: %v", err)
@@ -89,8 +91,8 @@ func TestOpenStorePragmasAndSchemaVersion(t *testing.T) {
 		t.Fatalf("busy_timeout = %d (err %v), want %d", busy, err, storeBusyTimeoutMillis)
 	}
 	var version int
-	if err := s.db.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&version); err != nil || version != 1 {
-		t.Fatalf("schema_version = %d (err %v), want 1", version, err)
+	if err := s.db.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&version); err != nil || version != 2 {
+		t.Fatalf("schema_version = %d (err %v), want 2", version, err)
 	}
 	stats, err := s.Stats()
 	if err != nil {
@@ -110,7 +112,7 @@ func TestOpenStorePragmasAndSchemaVersion(t *testing.T) {
 	}
 	defer reopened.Close()
 	stats, err = reopened.Stats()
-	if err != nil || *stats.RecordingSince != "2026-10-27T14:15:00Z" || stats.RowCounts[tableSchemaVersion] != 1 {
+	if err != nil || *stats.RecordingSince != "2026-10-27T14:15:00Z" || stats.RowCounts[tableSchemaVersion] != 2 {
 		t.Fatalf("after reopen: %+v (err %v)", stats, err)
 	}
 }
@@ -183,16 +185,17 @@ func TestWriteBatchSeparatesDimensions(t *testing.T) {
 	s, _ := openTestStore(t, time.Now())
 	at := time.Date(2026, 10, 27, 10, 0, 0, 0, time.UTC)
 	base := ledgerEvent{At: at, Provider: "p", Model: "m", AuthIndex: "a", ClientKey: "k"}
-	variants := []ledgerEvent{base, base, base, base, base}
+	variants := []ledgerEvent{base, base, base, base, base, base}
 	variants[1].Provider = "p2"
 	variants[2].Model = "m2"
 	variants[3].AuthIndex = "a2"
 	variants[4].ClientKey = "k2"
+	variants[5].Tier = "priority"
 	if err := s.WriteBatch(variants); err != nil {
 		t.Fatal(err)
 	}
-	if rows := readRollups(t, s, tableUsageMinute); len(rows) != 5 {
-		t.Fatalf("rows = %d, want 5 distinct keys", len(rows))
+	if rows := readRollups(t, s, tableUsageMinute); len(rows) != 6 {
+		t.Fatalf("rows = %d, want 6 distinct keys", len(rows))
 	}
 }
 
@@ -399,7 +402,8 @@ func TestSensitiveFieldsNeverReachDisk(t *testing.T) {
 		Model: "claude-sonnet", Alias: "SENTINEL-ALIAS", APIKey: apiKey, AccessProvider: "SENTINEL-ACCESS",
 		SessionID: "SENTINEL-SESSION", ParentSessionID: "SENTINEL-PARENT", AuthID: "SENTINEL-AUTHID@example.com.json",
 		AuthIndex: "0123456789abcdef", AuthType: "SENTINEL-AUTHTYPE", Source: "SENTINEL-SOURCE",
-		ReasoningEffort: "SENTINEL-EFFORT", ServiceTier: "SENTINEL-TIER", ResponseModel: "SENTINEL-RESPMODEL",
+		ReasoningEffort: "SENTINEL-EFFORT", ServiceTier: "SENTINEL-TIER", EffectiveServiceTier: "SENTINEL-EFFECTIVE",
+		ResponseServiceTier: "Priority", ResponseModel: "claude-sonnet-4-6-20260301",
 		RequestedAt: time.Now(), Latency: time.Second, Failed: true,
 		Failure: usageFailure{StatusCode: 529, Body: "SENTINEL-FAILURE-BODY prompt: tell me a secret"},
 		Detail:  usageDetail{InputTokens: 10, OutputTokens: 5},
@@ -419,7 +423,8 @@ func TestSensitiveFieldsNeverReachDisk(t *testing.T) {
 			raw = append(raw, b...)
 		}
 	}
-	if !bytes.Contains(raw, []byte("0123456789abcdef")) || !bytes.Contains(raw, []byte("claude-sonnet")) {
+	if !bytes.Contains(raw, []byte("0123456789abcdef")) || !bytes.Contains(raw, []byte("claude-sonnet-4-6-20260301")) ||
+		!bytes.Contains(raw, []byte("priority")) {
 		t.Fatal("expected whitelisted values in the database file")
 	}
 	for _, sentinel := range []string{"SENTINEL", "sentinel", apiKey[:20], "secret"} {
@@ -446,5 +451,136 @@ func TestEventFromRecordNormalizesTokensAndFallbacks(t *testing.T) {
 	want := tokenBuckets{Input: 100, Output: 30, CacheRead: 40, CacheCreation: 10, Reasoning: 12, Total: 192}
 	if e.Tokens != want {
 		t.Fatalf("tokens = %+v, want %+v", e.Tokens, want)
+	}
+}
+
+// stepTwoRollupDDL is the rollup table exactly as step 2 (schema v1) created
+// it, frozen here so the migration test does not depend on store.go.
+const stepTwoRollupDDL = `CREATE TABLE %s (
+	bucket_start          INTEGER NOT NULL, -- UTC bucket start, Unix seconds
+	provider              TEXT    NOT NULL,
+	model                 TEXT    NOT NULL,
+	auth_index            TEXT    NOT NULL, -- CPA's hashed credential index
+	client_key            TEXT    NOT NULL, -- masked client API key, see maskClientKey
+	failed                INTEGER NOT NULL CHECK (failed IN (0, 1)),
+	request_count         INTEGER NOT NULL DEFAULT 0,
+	failure_count         INTEGER NOT NULL DEFAULT 0,
+	input_tokens          INTEGER NOT NULL DEFAULT 0, -- uncached input
+	output_tokens         INTEGER NOT NULL DEFAULT 0, -- non-reasoning output
+	cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+	cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+	reasoning_tokens      INTEGER NOT NULL DEFAULT 0,
+	unclassified_tokens   INTEGER NOT NULL DEFAULT 0,
+	total_tokens          INTEGER NOT NULL DEFAULT 0,
+	latency_ms_sum        INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (bucket_start, provider, model, auth_index, client_key, failed)
+) WITHOUT ROWID`
+
+func TestMigrateV1ToV2(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.db")
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`,
+		`INSERT INTO schema_version VALUES (1, '2026-10-20T08:00:00Z')`,
+		`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID`,
+		`INSERT INTO meta VALUES ('recording_since', '2026-10-20T08:00:00Z')`,
+		fmt.Sprintf(stepTwoRollupDDL, "usage_minute"),
+		fmt.Sprintf(stepTwoRollupDDL, "usage_hour"),
+		`INSERT INTO usage_minute VALUES (1761552000, 'claude', 'claude-sonnet', 'idx', 'k', 0, 3, 0, 10, 5, 1, 2, 3, 4, 25, 900)`,
+		`INSERT INTO usage_minute VALUES (1761552000, 'claude', 'claude-sonnet', 'idx', 'k', 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 100)`,
+		`INSERT INTO usage_hour VALUES (1761552000, 'claude', 'claude-sonnet', 'idx', 'k', 0, 4, 1, 10, 5, 1, 2, 3, 4, 25, 1000)`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := OpenStore(path, time.Date(2026, 10, 28, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("OpenStore on a v1 database: %v", err)
+	}
+	defer s.Close()
+	var versions []int
+	rows, err := s.db.Query(`SELECT version FROM schema_version ORDER BY version`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var v int
+		_ = rows.Scan(&v)
+		versions = append(versions, v)
+	}
+	_ = rows.Close()
+	if fmt.Sprint(versions) != "[1 2]" {
+		t.Fatalf("schema versions = %v", versions)
+	}
+	stats, _ := s.Stats()
+	if stats.RecordingSince == nil || *stats.RecordingSince != "2026-10-20T08:00:00Z" {
+		t.Fatalf("recording_since = %v", stats.RecordingSince)
+	}
+	minute := readRollups(t, s, tableUsageMinute)
+	hour := readRollups(t, s, tableUsageHour)
+	if len(minute) != 2 || len(hour) != 1 {
+		t.Fatalf("rows after migration: minute %+v hour %+v", minute, hour)
+	}
+	if r := minute[0]; r.ServiceTier != "" || r.Requests != 3 || r.Input != 10 || r.Output != 5 || r.CacheRead != 1 ||
+		r.CacheCreation != 2 || r.Reasoning != 3 || r.Unclassif != 4 || r.Total != 25 || r.LatencyMs != 900 || r.Failed {
+		t.Fatalf("migrated minute row = %+v", r)
+	}
+	if r := hour[0]; r.Requests != 4 || r.Failures != 1 || r.LatencyMs != 1000 {
+		t.Fatalf("migrated hour row = %+v", r)
+	}
+	// service_tier is part of the key now: the same row with another tier is
+	// a new row, and the same tier accumulates.
+	at := time.Unix(1761552000, 0).UTC()
+	base := ledgerEvent{At: at, Provider: "claude", Model: "claude-sonnet", AuthIndex: "idx", ClientKey: "k", Tokens: tokenBuckets{Input: 1, Total: 1}}
+	priority := base
+	priority.Tier = "priority"
+	if err := s.WriteBatch([]ledgerEvent{base, priority}); err != nil {
+		t.Fatal(err)
+	}
+	hour = readRollups(t, s, tableUsageHour)
+	if len(hour) != 2 || hour[0].ServiceTier != "" || hour[0].Requests != 5 || hour[1].ServiceTier != "priority" {
+		t.Fatalf("hour rows after write = %+v", hour)
+	}
+	columns := tableColumns(t, s, tableUsageMinute)
+	if !reflect.DeepEqual(columns, sortedCopy(rollupColumns)) {
+		t.Fatalf("columns = %v", columns)
+	}
+	var indexes int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN ('usage_minute_auth_bucket', 'usage_hour_auth_bucket')`).Scan(&indexes); err != nil || indexes != 2 {
+		t.Fatalf("auth indexes = %d (err %v)", indexes, err)
+	}
+	var leftovers int
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%_v2'`).Scan(&leftovers)
+	if leftovers != 0 {
+		t.Fatal("temporary _v2 tables left behind")
+	}
+}
+
+func TestEventFromRecordUsesResponseModelAndBilledTier(t *testing.T) {
+	cases := []struct {
+		rec       usageRecord
+		model     string
+		tier      string
+		rationale string
+	}{
+		{usageRecord{Model: "gpt-5.5", ResponseModel: "gpt-5.5-2026-09-01"}, "gpt-5.5-2026-09-01", "", "response model wins"},
+		{usageRecord{Model: " gpt-5.5 ", ResponseModel: "  "}, "gpt-5.5", "", "falls back to the requested model"},
+		{usageRecord{ServiceTier: "auto", EffectiveServiceTier: "Priority", ResponseServiceTier: "default"}, "", "default", "response tier wins"},
+		{usageRecord{ServiceTier: "auto", EffectiveServiceTier: "Priority"}, "", "priority", "then the outbound tier"},
+		{usageRecord{ServiceTier: "flex"}, "", "flex", "then the client tier"},
+	}
+	for _, tc := range cases {
+		e := eventFromRecord(tc.rec, time.Now())
+		if e.Model != tc.model || e.Tier != tc.tier {
+			t.Fatalf("%s: model=%q tier=%q, want %q %q", tc.rationale, e.Model, e.Tier, tc.model, tc.tier)
+		}
 	}
 }

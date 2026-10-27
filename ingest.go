@@ -38,7 +38,18 @@ type controlRequest struct {
 
 // HandleUsage enqueues a record without ever blocking. It reports whether the
 // record was accepted; rejected records increment dropped_total.
+//
+// Records the host marks as not generated (Generate=false) are accepted but
+// not stored, and counted in skipped_total. pluginapi.UsageRecord has no
+// separate count-only flag: CPA's count-tokens executors never publish usage,
+// and Generate=false comes from a client body with "generate": false
+// (sdk/api/handlers/handlers.go:416) or a zero-token home-result 401 record
+// (sdk/cliproxy/auth/home_result.go:74).
 func (p *Plugin) HandleUsage(rec usageRecord) bool {
+	if rec.Generate != nil && !*rec.Generate {
+		p.skippedTotal.Add(1)
+		return true
+	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if p.closed {
@@ -66,6 +77,8 @@ func (p *Plugin) openStore(path string, cfg Config) error {
 // Records delivered afterwards wait in the queue until a later register/reconfigure reopens the
 // database; if the instance is shut down first they are counted as dropped.
 func (p *Plugin) Quiesce() error {
+	// The replacement copy runs its own price refresher.
+	p.prices.stop()
 	errQuiesce := p.sendControl(controlRequest{op: controlQuiesce})
 	if errors.Is(errQuiesce, errPluginStopped) {
 		return nil // Shutdown already flushed and closed.
@@ -153,10 +166,22 @@ func (p *Plugin) applyControl(req controlRequest) error {
 		if errOpen != nil {
 			return errOpen
 		}
+		nextReader, errReader := openReader(req.path)
+		if errReader != nil {
+			_ = next.Close()
+			return errReader
+		}
 		p.storeMu.Lock()
 		previous := p.store
 		p.store = next
 		p.storeMu.Unlock()
+		p.readMu.Lock() // waits for in-flight queries on the old reader
+		previousReader := p.reader
+		p.reader = nextReader
+		p.readMu.Unlock()
+		if errClose := previousReader.Close(); errClose != nil {
+			p.recordWriteError(fmt.Errorf("close reader: %w", errClose))
+		}
 		if previous != nil {
 			if errClose := previous.Close(); errClose != nil {
 				p.recordWriteError(fmt.Errorf("close %s: %w", previous.Path(), errClose))
@@ -175,14 +200,22 @@ func (p *Plugin) applyControl(req controlRequest) error {
 }
 
 func (p *Plugin) closeStore() error {
+	p.readMu.Lock() // waits for in-flight queries
+	reader := p.reader
+	p.reader = nil
+	p.readMu.Unlock()
+	errReader := reader.Close()
 	p.storeMu.Lock()
 	current := p.store
 	p.store = nil
 	p.storeMu.Unlock()
 	if current == nil {
-		return nil
+		return errReader
 	}
-	return current.Close()
+	if errClose := current.Close(); errClose != nil {
+		return errClose
+	}
+	return errReader
 }
 
 // runRetention deletes rows past the configured retention, using the injected

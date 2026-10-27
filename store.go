@@ -18,13 +18,14 @@ import (
 
 const (
 	// storeSchemaVersion is the latest migration in storeMigrations.
-	storeSchemaVersion = 1
+	storeSchemaVersion = 2
 
 	// storeBusyTimeoutMillis bounds how long a statement waits on a lock held
 	// by another connection (for example an operator running sqlite3 on the file).
 	storeBusyTimeoutMillis = 5000
 
 	metaKeyRecordingSince = "recording_since"
+	metaKeySettings       = "settings"
 
 	tableSchemaVersion = "schema_version"
 	tableMeta          = "meta"
@@ -37,11 +38,13 @@ var storeTables = []string{tableMeta, tableSchemaVersion, tableUsageHour, tableU
 
 // rollupColumns is the complete whitelist of persisted rollup columns. The
 // schema test asserts both rollup tables have exactly these columns, so adding
-// a field means editing this list on purpose.
+// a field means editing this list on purpose. The first rollupKeyColumnCount
+// columns form the primary key; the rest are counters.
 var rollupColumns = []string{
 	"bucket_start",
 	"provider",
 	"model",
+	"service_tier",
 	"auth_index",
 	"client_key",
 	"failed",
@@ -57,7 +60,35 @@ var rollupColumns = []string{
 	"latency_ms_sum",
 }
 
+const rollupKeyColumnCount = 7
+
+// rollupTableDDL is the current (schema v2) rollup table definition.
 func rollupTableDDL(table string) string {
+	return `CREATE TABLE ` + table + ` (
+	bucket_start          INTEGER NOT NULL, -- UTC bucket start, Unix seconds
+	provider              TEXT    NOT NULL,
+	model                 TEXT    NOT NULL, -- response model, else requested model
+	service_tier          TEXT    NOT NULL DEFAULT '',
+	auth_index            TEXT    NOT NULL, -- CPA's hashed credential index
+	client_key            TEXT    NOT NULL, -- masked client API key, see maskClientKey
+	failed                INTEGER NOT NULL CHECK (failed IN (0, 1)),
+	request_count         INTEGER NOT NULL DEFAULT 0,
+	failure_count         INTEGER NOT NULL DEFAULT 0,
+	input_tokens          INTEGER NOT NULL DEFAULT 0, -- uncached input
+	output_tokens         INTEGER NOT NULL DEFAULT 0, -- non-reasoning output
+	cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+	cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+	reasoning_tokens      INTEGER NOT NULL DEFAULT 0,
+	unclassified_tokens   INTEGER NOT NULL DEFAULT 0,
+	total_tokens          INTEGER NOT NULL DEFAULT 0,
+	latency_ms_sum        INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (bucket_start, provider, model, service_tier, auth_index, client_key, failed)
+) WITHOUT ROWID`
+}
+
+// rollupTableDDLv1 is the schema v1 definition. Migration 1 must keep creating
+// exactly this table so that upgrades replay the same history.
+func rollupTableDDLv1(table string) string {
 	return `CREATE TABLE ` + table + ` (
 	bucket_start          INTEGER NOT NULL, -- UTC bucket start, Unix seconds
 	provider              TEXT    NOT NULL,
@@ -79,6 +110,32 @@ func rollupTableDDL(table string) string {
 ) WITHOUT ROWID`
 }
 
+// rollupAuthIndexDDL indexes rollups by credential for the windows route.
+func rollupAuthIndexDDL(table string) string {
+	return `CREATE INDEX ` + table + `_auth_bucket ON ` + table + ` (auth_index, bucket_start)`
+}
+
+// migrateRollupToV2 rebuilds a v1 rollup table with service_tier in its
+// primary key. SQLite cannot alter a primary key, so the rows are copied into a
+// new table that then takes the old name. Existing rows get service_tier ”.
+func migrateRollupToV2(table string) []string {
+	selectColumns := make([]string, len(rollupColumns))
+	for i, column := range rollupColumns {
+		selectColumns[i] = column
+		if column == "service_tier" {
+			selectColumns[i] = "''"
+		}
+	}
+	return []string{
+		rollupTableDDL(table + "_v2"),
+		`INSERT INTO ` + table + `_v2 (` + strings.Join(rollupColumns, ", ") + `)
+SELECT ` + strings.Join(selectColumns, ", ") + ` FROM ` + table,
+		`DROP TABLE ` + table,
+		`ALTER TABLE ` + table + `_v2 RENAME TO ` + table,
+		rollupAuthIndexDDL(table),
+	}
+}
+
 // storeMigrations[i] upgrades the schema from version i to i+1. Each runs in
 // one transaction together with its schema_version row.
 var storeMigrations = [][]string{
@@ -87,9 +144,10 @@ var storeMigrations = [][]string{
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
 ) WITHOUT ROWID`,
-		rollupTableDDL(tableUsageMinute),
-		rollupTableDDL(tableUsageHour),
+		rollupTableDDLv1(tableUsageMinute),
+		rollupTableDDLv1(tableUsageHour),
 	},
+	append(migrateRollupToV2(tableUsageMinute), migrateRollupToV2(tableUsageHour)...),
 }
 
 // Store is the SQLite-backed rollup ledger. It is not safe for concurrent use;
@@ -209,6 +267,7 @@ type ledgerEvent struct {
 	At        time.Time
 	Provider  string
 	Model     string
+	Tier      string
 	AuthIndex string
 	ClientKey string // already masked
 	Failed    bool
@@ -219,6 +278,10 @@ type ledgerEvent struct {
 // eventFromRecord copies the persisted fields out of a delivered record. Request
 // and response headers, failure bodies, prompts, session and request IDs, and
 // the raw client API key are intentionally not copied.
+//
+// model is the model the upstream response reported (ResponseModel), falling
+// back to the model CPA requested (Model); see
+// internal/pluginhost/adapters_usage_translation.go:197 and :212.
 func eventFromRecord(rec usageRecord, now time.Time) ledgerEvent {
 	at := rec.RequestedAt
 	if at.IsZero() {
@@ -231,13 +294,31 @@ func eventFromRecord(rec usageRecord, now time.Time) ledgerEvent {
 	return ledgerEvent{
 		At:        at.UTC(),
 		Provider:  strings.TrimSpace(rec.Provider),
-		Model:     strings.TrimSpace(rec.Model),
+		Model:     firstNonEmpty(rec.ResponseModel, rec.Model),
+		Tier:      recordServiceTier(rec),
 		AuthIndex: strings.TrimSpace(rec.AuthIndex),
 		ClientKey: maskClientKey(rec.APIKey),
 		Failed:    rec.Failed,
 		Tokens:    bucketsFromUsage(rec.Detail, rec.Provider, rec.ExecutorType),
 		LatencyMs: latency,
 	}
+}
+
+// recordServiceTier is the tier the request was billed at, as far as CPA knows:
+// the tier the upstream response reported, else the tier in the final outbound
+// request, else the tier the client asked for (CPA fills "auto" when the client
+// sent none). Lowercased so "Priority" and "priority" share a row.
+func recordServiceTier(rec usageRecord) string {
+	return strings.ToLower(firstNonEmpty(rec.ResponseServiceTier, rec.EffectiveServiceTier, rec.ServiceTier))
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 // clientKeyMinSuffixLength is the shortest key whose last 4 characters are
@@ -266,6 +347,7 @@ type rollupKey struct {
 	BucketStart int64
 	Provider    string
 	Model       string
+	Tier        string
 	AuthIndex   string
 	ClientKey   string
 	Failed      bool
@@ -317,6 +399,7 @@ func aggregate(events []ledgerEvent, size time.Duration) map[rollupKey]*rollupVa
 			BucketStart: bucketStart(e.At, size),
 			Provider:    e.Provider,
 			Model:       e.Model,
+			Tier:        e.Tier,
 			AuthIndex:   e.AuthIndex,
 			ClientKey:   e.ClientKey,
 			Failed:      e.Failed,
@@ -333,13 +416,13 @@ func aggregate(events []ledgerEvent, size time.Duration) map[rollupKey]*rollupVa
 
 func upsertSQL(table string) string {
 	updates := make([]string, 0, len(rollupColumns))
-	for _, column := range rollupColumns[6:] {
+	for _, column := range rollupColumns[rollupKeyColumnCount:] {
 		updates = append(updates, column+" = "+column+" + excluded."+column)
 	}
 	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(rollupColumns)), ", ")
 	return `INSERT INTO ` + table + ` (` + strings.Join(rollupColumns, ", ") + `)
 VALUES (` + placeholders + `)
-ON CONFLICT (bucket_start, provider, model, auth_index, client_key, failed) DO UPDATE SET
+ON CONFLICT (` + strings.Join(rollupColumns[:rollupKeyColumnCount], ", ") + `) DO UPDATE SET
 	` + strings.Join(updates, ",\n\t")
 }
 
@@ -369,7 +452,7 @@ func (s *Store) WriteBatch(events []ledgerEvent) error {
 				failed = 1
 			}
 			if _, errExec := stmt.ExecContext(ctx,
-				key.BucketStart, key.Provider, key.Model, key.AuthIndex, key.ClientKey, failed,
+				key.BucketStart, key.Provider, key.Model, key.Tier, key.AuthIndex, key.ClientKey, failed,
 				v.Requests, v.Failures, v.Input, v.Output, v.CacheRead, v.CacheCreation,
 				v.Reasoning, v.Unclassified, v.Total, v.LatencyMs,
 			); errExec != nil {

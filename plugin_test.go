@@ -64,12 +64,18 @@ price-refresh-hours: 6
 	}
 }
 
-func TestParseConfigEmptyPriceURLUsesDefault(t *testing.T) {
-	cfg, err := ParseConfig([]byte("price-source-url: \"\"\n"))
-	if err != nil {
-		t.Fatalf("ParseConfig error: %v", err)
+func TestParseConfigEmptyPriceURLDisablesFetching(t *testing.T) {
+	for _, input := range []string{"price-source-url: \"\"\n", "price-source-url: \"  \"\n"} {
+		cfg, err := ParseConfig([]byte(input))
+		if err != nil {
+			t.Fatalf("ParseConfig(%q) error: %v", input, err)
+		}
+		if cfg.PriceSourceURL != "" {
+			t.Fatalf("PriceSourceURL = %q, want empty (disabled)", cfg.PriceSourceURL)
+		}
 	}
-	if cfg.PriceSourceURL != defaultPriceSourceURL {
+	// Omitting the key keeps the default.
+	if cfg, _ := ParseConfig([]byte("enabled: true\n")); cfg.PriceSourceURL != defaultPriceSourceURL {
 		t.Fatalf("PriceSourceURL = %q, want default", cfg.PriceSourceURL)
 	}
 }
@@ -212,6 +218,7 @@ func TestStatusJSONShape(t *testing.T) {
 		"plugin_version":      "0.1.0",
 		"records_total":       float64(0),
 		"dropped_total":       float64(0),
+		"skipped_total":       float64(0),
 		"write_errors_total":  float64(0),
 		"last_write_error":    nil,
 		"recording_since":     nil,
@@ -220,9 +227,10 @@ func TestStatusJSONShape(t *testing.T) {
 		"database_path":       nil,
 		"database_size_bytes": nil,
 		"row_counts":          nil,
+		"prices":              map[string]any{"source": "embedded", "fetched_at": nil},
 	})
 
-	dbPath := registerTestPlugin(t, p, "")
+	dbPath := registerTestPlugin(t, p, "price-source-url: \"\"\n")
 	p.HandleUsage(usageRecord{Provider: "claude", Model: "m", RequestedAt: fixed})
 	waitFor(t, "record flushed", func() bool { return p.recordsTotal.Load() == 1 })
 	got := assertStatus(t, p, map[string]any{
@@ -230,6 +238,7 @@ func TestStatusJSONShape(t *testing.T) {
 		"plugin_version":      "0.1.0",
 		"records_total":       float64(1),
 		"dropped_total":       float64(0),
+		"skipped_total":       float64(0),
 		"write_errors_total":  float64(0),
 		"last_write_error":    nil,
 		"recording_since":     "2026-10-27T11:30:45Z",
@@ -238,9 +247,10 @@ func TestStatusJSONShape(t *testing.T) {
 		"database_path":       dbPath,
 		"database_size_bytes": sizePlaceholder,
 		"row_counts": map[string]any{
-			"meta": float64(1), "schema_version": float64(1),
+			"meta": float64(1), "schema_version": float64(2),
 			"usage_hour": float64(1), "usage_minute": float64(1),
 		},
+		"prices": map[string]any{"source": "embedded", "fetched_at": nil},
 	})
 	if size, _ := got["database_size_bytes"].(float64); size <= 0 {
 		t.Fatalf("database_size_bytes = %v, want > 0", got["database_size_bytes"])
@@ -391,7 +401,7 @@ func TestRegisterRejectsInvalidConfig(t *testing.T) {
 	}
 }
 
-func TestManagementRegisterDeclaresStatusRoute(t *testing.T) {
+func TestManagementRegisterDeclaresAllRoutes(t *testing.T) {
 	p := newTestPlugin(t, 1, nil)
 	raw, err := p.HandleMethod(methodManagementRegister, nil)
 	if err != nil {
@@ -403,9 +413,17 @@ func TestManagementRegisterDeclaresStatusRoute(t *testing.T) {
 	if err := json.Unmarshal(raw, &env); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(env.Result.Routes) != 1 || env.Result.Routes[0].Method != "GET" ||
-		env.Result.Routes[0].Path != "usage-ledger/status" {
-		t.Fatalf("routes = %+v", env.Result.Routes)
+	var got []string
+	for _, route := range env.Result.Routes {
+		got = append(got, route.Method+" "+route.Path)
+	}
+	want := []string{
+		"GET usage-ledger/status", "GET usage-ledger/summary", "GET usage-ledger/series",
+		"POST usage-ledger/windows", "GET usage-ledger/blocks", "GET usage-ledger/prices",
+		"GET usage-ledger/settings", "PUT usage-ledger/settings", "GET usage-ledger/export",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("routes = %v, want %v", got, want)
 	}
 }
 
@@ -451,8 +469,20 @@ func newTestPlugin(t *testing.T, bufferSize int, now func() time.Time) *Plugin {
 	dir := t.TempDir()
 	p := NewPlugin(bufferSize, now)
 	p.getwd = func() (string, error) { return dir, nil }
+	// Tests never reach the real network: the default price URL fails fast,
+	// and only httptest servers on loopback are reachable.
+	p.prices.client.Transport = loopbackOnlyTransport{}
 	t.Cleanup(p.Shutdown)
 	return p
+}
+
+type loopbackOnlyTransport struct{}
+
+func (loopbackOnlyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if host := req.URL.Hostname(); host != "127.0.0.1" && host != "::1" && host != "localhost" {
+		return nil, errors.New("test transport: refusing non-loopback host " + host)
+	}
+	return http.DefaultTransport.RoundTrip(req)
 }
 
 // registerTestPlugin registers p with database-path "ledger.db" (relative to

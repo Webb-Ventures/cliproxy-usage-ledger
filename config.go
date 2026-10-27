@@ -26,8 +26,10 @@ type Config struct {
 	DatabasePath        string
 	MinuteRetentionDays int
 	HourRetentionDays   int
-	PriceSourceURL      string
-	PriceRefreshHours   int
+	// PriceSourceURL is the LiteLLM price JSON to fetch. Empty disables
+	// fetching.
+	PriceSourceURL    string
+	PriceRefreshHours int
 }
 
 // DefaultConfig returns the configuration used when a key is omitted.
@@ -73,9 +75,9 @@ func ParseConfig(configYAML []byte) (Config, error) {
 		cfg.HourRetentionDays = *raw.HourRetentionDays
 	}
 	if raw.PriceSourceURL != nil {
-		if trimmed := strings.TrimSpace(*raw.PriceSourceURL); trimmed != "" {
-			cfg.PriceSourceURL = trimmed
-		}
+		// An explicit empty value disables price fetching; omitting the key
+		// keeps the default URL.
+		cfg.PriceSourceURL = strings.TrimSpace(*raw.PriceSourceURL)
 	}
 	if raw.PriceRefreshHours != nil {
 		cfg.PriceRefreshHours = *raw.PriceRefreshHours
@@ -95,6 +97,9 @@ func (c Config) validate() error {
 	}
 	if c.PriceRefreshHours <= 0 {
 		return fmt.Errorf("usage-ledger: price-refresh-hours must be positive, got %d", c.PriceRefreshHours)
+	}
+	if c.PriceSourceURL == "" {
+		return nil // fetching disabled
 	}
 	parsed, errParse := url.Parse(c.PriceSourceURL)
 	if errParse != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
