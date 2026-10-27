@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"path/filepath"
 	"reflect"
@@ -117,8 +118,10 @@ func TestResolveDatabasePath(t *testing.T) {
 }
 
 func TestHandleUsageNeverBlocksAndCountsDrops(t *testing.T) {
-	// Not started: nothing drains, so the buffer fills deterministically.
-	p := NewPlugin(4, nil)
+	// The worker runs but no database is open yet, so it does not consume and
+	// the buffer fills deterministically.
+	p := newTestPlugin(t, 4, nil)
+	p.Start()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -135,11 +138,15 @@ func TestHandleUsageNeverBlocksAndCountsDrops(t *testing.T) {
 		t.Fatalf("dropped_total = %d, want 6", got)
 	}
 
-	// Starting the worker drains the 4 accepted records.
-	p.Start()
+	// Opening the database lets the worker drain the 4 accepted records, and
+	// shutdown flushes them.
+	dbPath := registerTestPlugin(t, p, "")
 	p.Shutdown()
 	if got := p.recordsTotal.Load(); got != 4 {
 		t.Fatalf("records_total = %d, want 4", got)
+	}
+	if got := countRequests(t, dbPath, tableUsageMinute); got != 4 {
+		t.Fatalf("persisted requests = %d, want 4", got)
 	}
 
 	// After shutdown, ingest still returns immediately and counts as dropped.
@@ -153,8 +160,8 @@ func TestHandleUsageNeverBlocksAndCountsDrops(t *testing.T) {
 }
 
 func TestHandleUsageConcurrentAccounting(t *testing.T) {
-	p := NewPlugin(usageBufferSize, nil)
-	p.Start()
+	p := newTestPlugin(t, usageBufferSize, nil)
+	dbPath := registerTestPlugin(t, p, "")
 	const workers, perWorker = 8, 2000
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
@@ -171,6 +178,12 @@ func TestHandleUsageConcurrentAccounting(t *testing.T) {
 	total := p.recordsTotal.Load() + p.droppedTotal.Load()
 	if total != workers*perWorker {
 		t.Fatalf("records_total+dropped_total = %d, want %d", total, workers*perWorker)
+	}
+	if got := countRequests(t, dbPath, tableUsageHour); got != int64(p.recordsTotal.Load()) {
+		t.Fatalf("persisted requests = %d, records_total = %d", got, p.recordsTotal.Load())
+	}
+	if p.writeErrorsTotal.Load() != 0 {
+		t.Fatalf("write errors: %v", *p.lastWriteError.Load())
 	}
 }
 
@@ -190,34 +203,62 @@ func TestShutdownWithoutStart(t *testing.T) {
 
 func TestStatusJSONShape(t *testing.T) {
 	fixed := time.Date(2026, 10, 27, 12, 30, 45, 123456789, time.FixedZone("x", 3600))
-	p := NewPlugin(8, func() time.Time { return fixed })
+	p := newTestPlugin(t, 8, func() time.Time { return fixed })
+	p.flushInterval = 10 * time.Millisecond
 
-	// Before any record: last_record_at and recording_since are null.
+	// Before register: no database, so every database field is null.
 	assertStatus(t, p, map[string]any{
-		"schema":          float64(1),
-		"plugin_version":  "0.1.0",
-		"records_total":   float64(0),
-		"dropped_total":   float64(0),
-		"recording_since": nil,
-		"last_record_at":  nil,
-		"retention":       map[string]any{"minute_days": float64(14), "hour_days": float64(400)},
+		"schema":              float64(1),
+		"plugin_version":      "0.1.0",
+		"records_total":       float64(0),
+		"dropped_total":       float64(0),
+		"write_errors_total":  float64(0),
+		"last_write_error":    nil,
+		"recording_since":     nil,
+		"last_record_at":      nil,
+		"retention":           map[string]any{"minute_days": float64(14), "hour_days": float64(400)},
+		"database_path":       nil,
+		"database_size_bytes": nil,
+		"row_counts":          nil,
 	})
 
-	p.Start()
-	p.HandleUsage(usageRecord{})
-	p.Shutdown()
-	assertStatus(t, p, map[string]any{
-		"schema":          float64(1),
-		"plugin_version":  "0.1.0",
-		"records_total":   float64(1),
-		"dropped_total":   float64(0),
-		"recording_since": nil,
-		"last_record_at":  "2026-10-27T11:30:45Z",
-		"retention":       map[string]any{"minute_days": float64(14), "hour_days": float64(400)},
+	dbPath := registerTestPlugin(t, p, "")
+	p.HandleUsage(usageRecord{Provider: "claude", Model: "m", RequestedAt: fixed})
+	waitFor(t, "record flushed", func() bool { return p.recordsTotal.Load() == 1 })
+	got := assertStatus(t, p, map[string]any{
+		"schema":              float64(1),
+		"plugin_version":      "0.1.0",
+		"records_total":       float64(1),
+		"dropped_total":       float64(0),
+		"write_errors_total":  float64(0),
+		"last_write_error":    nil,
+		"recording_since":     "2026-10-27T11:30:45Z",
+		"last_record_at":      "2026-10-27T11:30:45Z",
+		"retention":           map[string]any{"minute_days": float64(14), "hour_days": float64(400)},
+		"database_path":       dbPath,
+		"database_size_bytes": sizePlaceholder,
+		"row_counts": map[string]any{
+			"meta": float64(1), "schema_version": float64(1),
+			"usage_hour": float64(1), "usage_minute": float64(1),
+		},
 	})
+	if size, _ := got["database_size_bytes"].(float64); size <= 0 {
+		t.Fatalf("database_size_bytes = %v, want > 0", got["database_size_bytes"])
+	}
+
+	// A write error shows up in the counters without stopping ingest.
+	p.recordWriteError(errors.New("disk I/O error"))
+	st := p.Status()
+	if st.WriteErrorsTotal != 1 || st.LastWriteError == nil || *st.LastWriteError != "disk I/O error" {
+		t.Fatalf("write error status = %d %v", st.WriteErrorsTotal, st.LastWriteError)
+	}
 }
 
-func assertStatus(t *testing.T, p *Plugin, want map[string]any) {
+// sizePlaceholder stands in for database_size_bytes, which depends on SQLite's
+// page layout; assertStatus checks the key is present and numeric.
+const sizePlaceholder = "<size>"
+
+func assertStatus(t *testing.T, p *Plugin, want map[string]any) map[string]any {
 	t.Helper()
 	raw, err := p.HandleMethod(methodManagementHandle, mustJSON(t, managementRequest{
 		Method: http.MethodGet,
@@ -243,14 +284,24 @@ func assertStatus(t *testing.T, p *Plugin, want map[string]any) {
 	if err := json.Unmarshal(env.Result.Body, &got); err != nil {
 		t.Fatalf("decode status body %s: %v", env.Result.Body, err)
 	}
-	if !reflect.DeepEqual(got, want) {
+	compared := make(map[string]any, len(got))
+	for k, v := range got {
+		compared[k] = v
+	}
+	if want["database_size_bytes"] == sizePlaceholder {
+		if _, ok := got["database_size_bytes"].(float64); !ok {
+			t.Fatalf("database_size_bytes = %#v, want a number", got["database_size_bytes"])
+		}
+		compared["database_size_bytes"] = sizePlaceholder
+	}
+	if !reflect.DeepEqual(compared, want) {
 		t.Fatalf("status = %#v\nwant   %#v", got, want)
 	}
+	return got
 }
 
 func TestStatusReflectsReconfiguredRetention(t *testing.T) {
-	p := NewPlugin(1, nil)
-	defer p.Shutdown()
+	p := newTestPlugin(t, 1, nil)
 	cfgYAML := []byte("minute-retention-days: 3\nhour-retention-days: 30\n")
 	if _, err := p.HandleMethod(methodPluginReconfigure, mustJSON(t, lifecycleRequest{ConfigYAML: cfgYAML})); err != nil {
 		t.Fatalf("reconfigure error: %v", err)
@@ -262,8 +313,7 @@ func TestStatusReflectsReconfiguredRetention(t *testing.T) {
 }
 
 func TestManagementHandleRejectsOtherRoutes(t *testing.T) {
-	p := NewPlugin(1, nil)
-	defer p.Shutdown()
+	p := newTestPlugin(t, 1, nil)
 	if resp := p.handleManagement(managementRequest{Method: "POST", Path: statusRouteFullPath}); resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("POST status = %d, want 405", resp.StatusCode)
 	}
@@ -273,8 +323,7 @@ func TestManagementHandleRejectsOtherRoutes(t *testing.T) {
 }
 
 func TestRegistrationPayload(t *testing.T) {
-	p := NewPlugin(1, nil)
-	defer p.Shutdown()
+	p := newTestPlugin(t, 1, nil)
 	raw, err := p.HandleMethod(methodPluginRegister, mustJSON(t, lifecycleRequest{SchemaVersion: 7}))
 	if err != nil {
 		t.Fatalf("register error: %v", err)
@@ -332,8 +381,7 @@ func TestRegistrationPayload(t *testing.T) {
 }
 
 func TestRegisterRejectsInvalidConfig(t *testing.T) {
-	p := NewPlugin(1, nil)
-	defer p.Shutdown()
+	p := newTestPlugin(t, 1, nil)
 	req := mustJSON(t, lifecycleRequest{ConfigYAML: []byte("hour-retention-days: 0\n")})
 	if _, err := p.HandleMethod(methodPluginRegister, req); err == nil {
 		t.Fatal("expected register to fail for invalid config")
@@ -344,8 +392,7 @@ func TestRegisterRejectsInvalidConfig(t *testing.T) {
 }
 
 func TestManagementRegisterDeclaresStatusRoute(t *testing.T) {
-	p := NewPlugin(1, nil)
-	defer p.Shutdown()
+	p := newTestPlugin(t, 1, nil)
 	raw, err := p.HandleMethod(methodManagementRegister, nil)
 	if err != nil {
 		t.Fatalf("management.register error: %v", err)
@@ -386,13 +433,48 @@ func TestUsageHandleDecodesHostRecord(t *testing.T) {
 }
 
 func TestUnknownMethodEnvelope(t *testing.T) {
-	raw, err := NewPlugin(1, nil).HandleMethod("plugin.quiesce", nil)
+	raw, err := NewPlugin(1, nil).HandleMethod("plugin.frobnicate", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	var env envelope
 	if err := json.Unmarshal(raw, &env); err != nil || env.OK || env.Error == nil || env.Error.Code != "unknown_method" {
 		t.Fatalf("envelope = %s (err %v)", raw, err)
+	}
+}
+
+// newTestPlugin returns a plugin whose working directory is a fresh temp dir,
+// so the default and relative database paths never touch the repository. The
+// plugin is shut down before the temp dir is removed.
+func newTestPlugin(t *testing.T, bufferSize int, now func() time.Time) *Plugin {
+	t.Helper()
+	dir := t.TempDir()
+	p := NewPlugin(bufferSize, now)
+	p.getwd = func() (string, error) { return dir, nil }
+	t.Cleanup(p.Shutdown)
+	return p
+}
+
+// registerTestPlugin registers p with database-path "ledger.db" (relative to
+// its temp working directory) plus extraYAML, and returns the resolved path.
+func registerTestPlugin(t *testing.T, p *Plugin, extraYAML string) string {
+	t.Helper()
+	cfg := []byte("database-path: ledger.db\n" + extraYAML)
+	if _, err := p.HandleMethod(methodPluginRegister, mustJSON(t, lifecycleRequest{ConfigYAML: cfg})); err != nil {
+		t.Fatalf("register error: %v", err)
+	}
+	wd, _ := p.getwd()
+	return filepath.Join(wd, "ledger.db")
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

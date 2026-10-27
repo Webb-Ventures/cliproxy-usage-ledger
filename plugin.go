@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,6 +45,7 @@ const (
 const (
 	methodPluginRegister     = "plugin.register"
 	methodPluginReconfigure  = "plugin.reconfigure"
+	methodPluginQuiesce      = "plugin.quiesce"
 	methodUsageHandle        = "usage.handle"
 	methodManagementRegister = "management.register"
 	methodManagementHandle   = "management.handle"
@@ -129,6 +131,7 @@ type managementResponse struct {
 }
 
 // usageRecord mirrors pluginapi.UsageRecord. Durations arrive as nanoseconds.
+// Only the fields copied by eventFromRecord (store.go) are persisted.
 type usageRecord struct {
 	RequestID            string
 	TraceID              string
@@ -181,13 +184,18 @@ type usageDetail struct {
 // ---- Status document ----
 
 type statusResponse struct {
-	Schema         int             `json:"schema"`
-	PluginVersion  string          `json:"plugin_version"`
-	RecordsTotal   uint64          `json:"records_total"`
-	DroppedTotal   uint64          `json:"dropped_total"`
-	RecordingSince *string         `json:"recording_since"`
-	LastRecordAt   *string         `json:"last_record_at"`
-	Retention      statusRetention `json:"retention"`
+	Schema            int              `json:"schema"`
+	PluginVersion     string           `json:"plugin_version"`
+	RecordsTotal      uint64           `json:"records_total"`
+	DroppedTotal      uint64           `json:"dropped_total"`
+	WriteErrorsTotal  uint64           `json:"write_errors_total"`
+	LastWriteError    *string          `json:"last_write_error"`
+	RecordingSince    *string          `json:"recording_since"`
+	LastRecordAt      *string          `json:"last_record_at"`
+	Retention         statusRetention  `json:"retention"`
+	DatabasePath      *string          `json:"database_path"`
+	DatabaseSizeBytes *int64           `json:"database_size_bytes"`
+	RowCounts         map[string]int64 `json:"row_counts"`
 }
 
 type statusRetention struct {
@@ -200,7 +208,13 @@ type statusRetention struct {
 // Plugin holds runtime state. All exported behaviour is safe for concurrent
 // use; the host may invoke RPC methods from multiple goroutines.
 type Plugin struct {
-	now func() time.Time
+	now   func() time.Time
+	getwd func() (string, error)
+
+	// Worker tuning. Set before Start; tests shorten them.
+	batchSize         int
+	flushInterval     time.Duration
+	retentionInterval time.Duration
 
 	config atomic.Pointer[Config]
 
@@ -210,9 +224,18 @@ type Plugin struct {
 	closed  bool
 	records chan usageRecord
 
-	recordsTotal atomic.Uint64
-	droppedTotal atomic.Uint64
-	lastRecordAt atomic.Int64 // UnixNano; 0 means no record yet.
+	// storeMu guards store. Only the worker goroutine replaces store (holding
+	// storeMu); writes, retention, and status reads hold it while they run.
+	storeMu sync.Mutex
+	store   *Store
+
+	control chan controlRequest
+
+	recordsTotal     atomic.Uint64 // records committed to the database
+	droppedTotal     atomic.Uint64
+	writeErrorsTotal atomic.Uint64
+	lastWriteError   atomic.Pointer[string]
+	lastRecordAt     atomic.Int64 // UnixNano; 0 means no record yet.
 
 	startOnce sync.Once
 	stopOnce  sync.Once
@@ -229,10 +252,15 @@ func NewPlugin(bufferSize int, now func() time.Time) *Plugin {
 		now = time.Now
 	}
 	p := &Plugin{
-		now:     now,
-		records: make(chan usageRecord, bufferSize),
-		stop:    make(chan struct{}),
-		done:    make(chan struct{}),
+		now:               now,
+		getwd:             os.Getwd,
+		batchSize:         defaultFlushBatchSize,
+		flushInterval:     defaultFlushInterval,
+		retentionInterval: defaultRetentionInterval,
+		records:           make(chan usageRecord, bufferSize),
+		control:           make(chan controlRequest),
+		stop:              make(chan struct{}),
+		done:              make(chan struct{}),
 	}
 	cfg := DefaultConfig()
 	p.config.Store(&cfg)
@@ -244,8 +272,9 @@ func (p *Plugin) Start() {
 	p.startOnce.Do(func() { go p.run() })
 }
 
-// Shutdown stops accepting records, drains what is already queued, and waits
-// for the worker to exit. It is idempotent and safe if Start was never called.
+// Shutdown stops accepting records, drains what is already queued into the
+// database, flushes, closes the database, and waits for the worker to exit. It
+// is idempotent and safe if Start was never called.
 func (p *Plugin) Shutdown() {
 	p.stopOnce.Do(func() {
 		p.mu.Lock()
@@ -263,58 +292,16 @@ func (p *Plugin) Config() Config {
 	return *p.config.Load()
 }
 
-// HandleUsage enqueues a record without ever blocking. It reports whether the
-// record was accepted; rejected records increment dropped_total.
-func (p *Plugin) HandleUsage(rec usageRecord) bool {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.closed {
-		p.droppedTotal.Add(1)
-		return false
-	}
-	select {
-	case p.records <- rec:
-		return true
-	default:
-		p.droppedTotal.Add(1)
-		return false
-	}
-}
-
-func (p *Plugin) run() {
-	defer close(p.done)
-	for {
-		select {
-		case rec := <-p.records:
-			p.process(rec)
-		case <-p.stop:
-			for {
-				select {
-				case rec := <-p.records:
-					p.process(rec)
-				default:
-					return
-				}
-			}
-		}
-	}
-}
-
-// process is the storage hook. Step 1 only counts records.
-func (p *Plugin) process(_ usageRecord) {
-	p.recordsTotal.Add(1)
-	p.lastRecordAt.Store(p.now().UTC().UnixNano())
-}
-
 // Status builds the status document served by the management route.
 func (p *Plugin) Status() statusResponse {
 	cfg := p.Config()
 	status := statusResponse{
-		Schema:         statusSchema,
-		PluginVersion:  pluginVersion,
-		RecordsTotal:   p.recordsTotal.Load(),
-		DroppedTotal:   p.droppedTotal.Load(),
-		RecordingSince: nil, // Populated once persistent storage exists (step 2).
+		Schema:           statusSchema,
+		PluginVersion:    pluginVersion,
+		RecordsTotal:     p.recordsTotal.Load(),
+		DroppedTotal:     p.droppedTotal.Load(),
+		WriteErrorsTotal: p.writeErrorsTotal.Load(),
+		LastWriteError:   p.lastWriteError.Load(),
 		Retention: statusRetention{
 			MinuteDays: cfg.MinuteRetentionDays,
 			HourDays:   cfg.HourRetentionDays,
@@ -323,6 +310,19 @@ func (p *Plugin) Status() statusResponse {
 	if last := p.lastRecordAt.Load(); last != 0 {
 		formatted := time.Unix(0, last).UTC().Format(time.RFC3339)
 		status.LastRecordAt = &formatted
+	}
+	// Database fields stay null while no database is open (before register,
+	// after quiesce, or after shutdown).
+	p.storeMu.Lock()
+	defer p.storeMu.Unlock()
+	if p.store != nil {
+		path := p.store.Path()
+		status.DatabasePath = &path
+		if stats, errStats := p.store.Stats(); errStats == nil {
+			status.RecordingSince = stats.RecordingSince
+			status.DatabaseSizeBytes = &stats.SizeBytes
+			status.RowCounts = stats.RowCounts
+		}
 	}
 	return status
 }
@@ -333,6 +333,13 @@ func (p *Plugin) HandleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
 	case methodPluginRegister, methodPluginReconfigure:
 		return p.handleLifecycle(request)
+	case methodPluginQuiesce:
+		// The host sends {} and expects an empty result
+		// (internal/pluginhost/host.go callQuiesce, rpcEmptyResponse).
+		if errQuiesce := p.Quiesce(); errQuiesce != nil {
+			return nil, errQuiesce
+		}
+		return okEnvelope(struct{}{})
 	case methodUsageHandle:
 		var rec usageRecord
 		if errUnmarshal := json.Unmarshal(request, &rec); errUnmarshal != nil {
@@ -355,7 +362,7 @@ func (p *Plugin) HandleMethod(method string, request []byte) ([]byte, error) {
 		}
 		return okEnvelope(p.handleManagement(req))
 	default:
-		// The host treats unknown_method as "unsupported" (e.g. plugin.quiesce).
+		// The host treats unknown_method as "unsupported".
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
 }
@@ -371,8 +378,20 @@ func (p *Plugin) handleLifecycle(request []byte) ([]byte, error) {
 	if errParse != nil {
 		return nil, errParse
 	}
+	workingDir, errWd := p.getwd()
+	if errWd != nil {
+		workingDir = "" // Absolute database paths still resolve.
+	}
+	path, errResolve := cfg.ResolveDatabasePath(workingDir)
+	if errResolve != nil {
+		return nil, errResolve
+	}
+	// Opens the database, reopens it if database-path changed, or reopens it
+	// after a quiesce when the host rolls a replacement back.
+	if errOpen := p.openStore(path, cfg); errOpen != nil {
+		return nil, errOpen
+	}
 	p.config.Store(&cfg)
-	p.Start()
 	return okEnvelope(buildRegistration(req.SchemaVersion))
 }
 

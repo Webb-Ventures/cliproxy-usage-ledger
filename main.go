@@ -1,7 +1,8 @@
 package main
 
 // C ABI v1 glue for CLIProxyAPI native plugins. This file only marshals bytes
-// across the boundary; all behaviour lives in plugin.go. The struct layouts
+// across the boundary; all behaviour lives in the plain Go files (plugin.go,
+// ingest.go, store.go, tokens.go, config.go). The struct layouts
 // match examples/plugin/*/go/main.go and internal/pluginhost/loader_unix.go.
 
 /*
