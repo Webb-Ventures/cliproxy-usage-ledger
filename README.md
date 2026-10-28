@@ -788,6 +788,27 @@ unzip usage-ledger_0.2.0_linux_amd64.zip -d plugins/linux/amd64/
 
 ## Install into CLIProxyAPI
 
+### From the plugin store
+
+`registry.json` in this repository is a CPA plugin store registry. Add it as a
+store source, then install Usage Ledger from the Plugin Store page. The store
+downloads the release zip for the server's platform and checks it against
+`checksums.txt`. CPA doesn't update store plugins on its own: when a newer
+release is published, the Plugin Store page marks it and you click Update.
+
+```yaml
+plugins:
+  enabled: true
+  dir: "plugins"
+  store-sources:
+    - "https://raw.githubusercontent.com/Webb-Ventures/cliproxy-usage-ledger/main/registry.json"
+```
+
+Set `database-path` (see step 2 below) when CPA runs in a container, so the
+database lives on a mounted volume and survives image updates.
+
+### By hand
+
 1. Copy the library into CPA's plugins directory. That directory is
    `plugins.dir`, which defaults to `plugins`. A relative path resolves against
    CPA's working directory. CPA looks in `<dir>/<goos>/<goarch>/` first, then in

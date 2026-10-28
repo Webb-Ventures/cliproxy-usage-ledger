@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "usage-ledger",
+      "name": "Usage Ledger",
+      "description": "Records token usage per model, credential and client key, values it at API prices, and serves usage summaries to the management panel.",
+      "author": "Webb Ventures",
+      "repository": "https://github.com/Webb-Ventures/cliproxy-usage-ledger",
+      "tags": ["usage", "cost", "quota"],
+      "install": { "type": "github-release" }
+    }
+  ]
+}
